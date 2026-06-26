@@ -30,6 +30,7 @@
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 import time
@@ -64,9 +65,22 @@ def bold(s):   return f"\033[1m{s}\033[0m"
 
 def opencli(session, args_list, timeout=15):
     """调用 opencli browser <session> ..."""
-    cmd = ["opencli", "browser", session] + args_list
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    return p.stdout.strip(), p.stderr.strip(), p.returncode
+    exe = shutil.which("opencli")
+    if not exe:
+        print(red("❌ 未找到 opencli 可执行文件"))
+        print("   请先安装：npm install -g @jackwener/opencli")
+        print("   若已安装，请确认 opencli 已加入 PATH。")
+        sys.exit(1)
+    cmd = [exe, "browser", session] + args_list
+    p = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
+    return (p.stdout or "").strip(), (p.stderr or "").strip(), p.returncode
 
 
 def eval_js(session, js_code, timeout=10):
