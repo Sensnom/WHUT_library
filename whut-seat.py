@@ -235,11 +235,7 @@ def resolve_start_end(token, date_str, start_arg, duration_arg):
         start = max(current_min + 5, 450)   # 450 = 07:30
         start = ((start + 29) // 30) * 30   # 对齐到 30 分钟
 
-    # 结束时间 — 通过 API 获取可用选项
-    # 负数时长 = 预约到 22:00，直接返回，无需调 API
-    if duration_arg and duration_arg < 0:
-        return start, 1320
-
+    # 结束时间 — 通过 API 获取可用选项；负数时长表示预约到当天最晚可用结束时间
     resp = api_post(
         f"frontApi/res/getEndTimes2/{BUILDING_ID}/{start}",
         token,
@@ -249,7 +245,7 @@ def resolve_start_end(token, date_str, start_arg, duration_arg):
         options = resp["data"]  # [[minute_str, "HH:MM"], ...]
         max_end = int(options[-1][0])  # 最晚可用结束时间
 
-        if duration_arg:
+        if duration_arg and duration_arg > 0:
             # 用户指定了时长（分钟）
             target = start + duration_arg
             end = None
@@ -260,11 +256,11 @@ def resolve_start_end(token, date_str, start_arg, duration_arg):
             if end is None:
                 end = max_end  # 超出范围就用最晚的
         else:
-            end = max_end  # 默认最长
+            end = max_end  # 默认最长；负数时长也预约到当天最晚可用结束时间
     else:
         # fallback
         print(yellow("   ⚠️  无法获取精确结束时间，用默认值"))
-        end = min(start + (duration_arg or 840), 1320)
+        end = 1320 if duration_arg and duration_arg < 0 else min(start + (duration_arg or 840), 1320)
 
     return start, end
 
@@ -311,7 +307,7 @@ def find_candidate(token, room, date_str, target_start, target_end, min_duration
     if not seats or not seats.get("status"):
         return False, "API 错误"
 
-    BLACKLIST = {"001", "002", "003", "004", "005", "187", "188", "189", "190", "191", "192", "193", "194"}
+    BLACKLIST = {"001", "002", "003", "004", "005", "187", "188", "189", "190", "191", "192", "193", "194","85"}
 
     free_candidates = [
         (sid, info) for sid, info in seats["data"].items()
