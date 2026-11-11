@@ -2,8 +2,8 @@
 """
 武汉理工大学南湖图书馆 — 座位预约抢座脚本
 跨平台：Linux / Windows / macOS
-依赖：pip install requests (Python 3.8+)
-需要：opencli (npm i -g @jackwener/opencli)
+依赖：requests、playwright、python-dotenv (Python 3.9+)
+浏览器：python -m playwright install chromium
 
 默认行为：
   - 不带参数运行会进入交互式配置
@@ -29,21 +29,29 @@
 """
 
 import argparse
+import hashlib
 import json
-import shutil
-import subprocess
-import sys
-import time
+import os
 import random
+import sys
+import tempfile
+import time
+from contextlib import contextmanager
 from datetime import datetime, date
+from pathlib import Path
+from threading import Lock, local
+from urllib.parse import quote, urlsplit
+
+from reservation_captcha import CaptchaAttemptError, CaptchaError, ReservationCaptcha
 
 # ============================================================
 # 配置常量
 # ============================================================
 
-API_BASE = "https://zw.whut.edu.cn/jsq/static"
+APP_ORIGIN = "https://zw.whut.edu.cn"
+API_BASE = f"{APP_ORIGIN}/jsq/static"
 BUILDING_ID = "2009170845461745664"  # 南湖馆
-APP_URL = "https://zw.whut.edu.cn/jsq-v/"
+APP_URL = f"{APP_ORIGIN}/jsq-v/"
 
 # 楼层 → {name, floorId}
 FLOOR_NAMES = {6: "六楼", 7: "七楼"}
@@ -60,93 +68,297 @@ def bold(s):   return f"\033[1m{s}\033[0m"
 
 
 # ============================================================
-# opencli 桥接
+# 统一身份认证
 # ============================================================
 
-def opencli(session, args_list, timeout=15):
-    """调用 opencli browser <session> ..."""
-    exe = shutil.which("opencli")
-    if not exe:
-        print(red("❌ 未找到 opencli 可执行文件"))
-        print("   请先安装：npm install -g @jackwener/opencli")
-        print("   若已安装，请确认 opencli 已加入 PATH。")
-        sys.exit(1)
-    cmd = [exe, "browser", session] + args_list
-    p = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout,
-    )
-    return (p.stdout or "").strip(), (p.stderr or "").strip(), p.returncode
+PROJECT_DIR = Path(__file__).resolve().parent
+SSO_ORIGIN = "https://one.whut.edu.cn"
+SSO_PATH = "/tpass/login"
+
+LOGIN_STATE = r"""
+({appOrigin, ssoOrigin, ssoPath, submitted}) => {
+    if (location.origin === appOrigin) {
+        const token = sessionStorage.getItem('jsq_p-token');
+        if (token && token.length > 5) return {token};
+    }
+    if (location.origin !== ssoOrigin) return null;
+
+    const text = document.body?.innerText || '';
+    if (/滑块|人机验证|请输入验证码|短信验证|二次验证|安全验证|拖动滑块/.test(text))
+        return {verification: true};
+    if (submitted && /账号或密码|用户名或密码|密码错误|密码不正确|账号锁定|登录失败/.test(text))
+        return {rejected: true};
+    if (!submitted && location.pathname === ssoPath &&
+        document.querySelector('#un') && document.querySelector('#pd') &&
+        document.querySelector('#index_login_btn'))
+        return {form: true};
+    return null;
+}
+"""
 
 
-def eval_js(session, js_code, timeout=10):
-    """在页面中执行 JS 返回纯文本"""
-    out, _, rc = opencli(session, ["eval", js_code], timeout=timeout)
-    return out if rc == 0 else None
+class LoginError(RuntimeError):
+    """统一身份认证无法在无头模式下完成。"""
 
 
-def get_token(session):
-    """从浏览器 sessionStorage 获取 auth token"""
-    t = eval_js(session, "sessionStorage.getItem('jsq_p-token')")
-    return t if t and len(t) > 5 else None
+def authenticate_page(page, username, password):
+    """复用有效会话，或在确认的统一认证页面提交一次密码。"""
+    page.goto(APP_URL, wait_until="domcontentloaded")
+    state_args = {
+        "appOrigin": APP_ORIGIN,
+        "ssoOrigin": SSO_ORIGIN,
+        "ssoPath": SSO_PATH,
+        "submitted": False,
+    }
+    state = page.wait_for_function(LOGIN_STATE, arg=state_args).json_value()
+    if state.get("form"):
+        def check_origin():
+            url = urlsplit(page.url)
+            if (f"{url.scheme}://{url.netloc}", url.path) != (SSO_ORIGIN, SSO_PATH):
+                raise LoginError("统一认证页面已跳转，请重新运行脚本。")
+
+        if not page.locator("#un").is_visible():
+            check_origin()
+            page.locator("#password_login").click()
+        check_origin()
+        page.locator("#un").fill(username)
+        check_origin()
+        page.locator("#pd").fill(password)
+        check_origin()
+        page.locator("#index_login_btn").click()
+        state_args["submitted"] = True
+        state = page.wait_for_function(LOGIN_STATE, arg=state_args).json_value()
+
+    if state.get("verification"):
+        raise LoginError("学校要求验证码或二次验证，本次无头登录已停止。")
+    if state.get("rejected"):
+        raise LoginError("学校拒绝了登录，请检查账号、密码或账号状态。")
+    return state["token"]
 
 
-def get_user_info(session):
-    """获取登录用户信息"""
-    raw = eval_js(session, "sessionStorage.getItem('jsq_p-userInfo')")
-    if raw:
+def save_auth_state(path, state):
+    """以私有权限原子保存会话，避免中断时留下半个文件。"""
+    path.parent.mkdir(mode=0o700, exist_ok=True)
+    temp = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False)
+    temp_path = Path(temp.name)
+    try:
+        with temp:
+            json.dump(state, temp)
+        temp_path.replace(path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+class SeatLogin:
+    def __init__(self, session):
         try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            pass
-    return None
+            from dotenv import dotenv_values
+        except ImportError:
+            raise LoginError("请先安装依赖：python -m pip install requests playwright python-dotenv") from None
+
+        config = dotenv_values(PROJECT_DIR / ".env", interpolate=False)
+        self.username = (os.environ.get("WHUT_USERNAME", config.get("WHUT_USERNAME")) or "").strip()
+        self.password = os.environ.get("WHUT_PASSWORD", config.get("WHUT_PASSWORD"))
+        if not self.username or not self.password:
+            raise LoginError("请在项目目录的 .env 中设置 WHUT_USERNAME 和 WHUT_PASSWORD。")
+
+        cache_key = hashlib.sha256(f"{session}\0{self.username}".encode()).hexdigest()
+        self.cache_path = PROJECT_DIR / ".whut-auth" / f"{cache_key}.json"
+
+    def authenticate(self, expired_token=None):
+        with self.browser_page(expired_token) as (_, token):
+            return token
+
+    def renew_page(self, page, expired_token, *, on_page=None):
+        """Renew authentication in the existing browser's fresh context."""
+        context = page.context.browser.new_context(viewport={"width": 1440, "height": 900})
+        try:
+            replacement = context.new_page()
+            replacement.set_default_timeout(20000)
+            if on_page is not None:
+                on_page(replacement)
+            token = authenticate_page(replacement, self.username, self.password)
+            if token == expired_token:
+                raise LoginError("重新登录后仍收到已过期的 Token。")
+            try:
+                save_auth_state(self.cache_path, context.storage_state())
+            except OSError:
+                print(yellow("⚠️  已登录，会话缓存写入失败。"))
+        except BaseException:
+            context.close()
+            raise
+        page.context.close()
+        return replacement, token
+
+    @contextmanager
+    def browser_page(self, expired_token=None, *, on_page=None):
+        try:
+            from playwright.sync_api import Error, TimeoutError, sync_playwright
+        except ImportError:
+            raise LoginError("请先安装 Playwright，再运行 python -m playwright install chromium。") from None
+
+        state = None
+        if expired_token is None:
+            try:
+                saved_state = json.loads(self.cache_path.read_text(encoding="utf-8"))
+                if isinstance(saved_state, dict):
+                    state = saved_state
+            except (OSError, ValueError):
+                pass
+
+        print(cyan("🌐 正在通过无头浏览器登录座位预约系统..."))
+        authenticated = False
+        try:
+            with sync_playwright() as driver:
+                try:
+                    browser = driver.chromium.launch(headless=True)
+                except Error:
+                    raise LoginError("Chromium 无法启动，请运行 python -m playwright install chromium 并检查系统依赖。") from None
+                with browser:
+                    try:
+                        context = browser.new_context(storage_state=state, viewport={"width": 1440, "height": 900})
+                    except Error:
+                        if state is None:
+                            raise
+                        context = browser.new_context(viewport={"width": 1440, "height": 900})
+                    page = context.new_page()
+                    page.set_default_timeout(20000)
+                    if on_page is not None:
+                        on_page(page)
+                    token = authenticate_page(page, self.username, self.password)
+                    if token == expired_token:
+                        raise LoginError("重新登录后仍收到已过期的 Token。")
+                    try:
+                        save_auth_state(self.cache_path, context.storage_state())
+                    except (OSError, Error):
+                        print(yellow("⚠️  已登录，会话缓存写入失败。"))
+                    print(green("✅ 登录成功"))
+                    authenticated = True
+                    yield page, token
+        except TimeoutError:
+            if authenticated:
+                raise
+            raise LoginError("等待学校认证页面或预约 Token 超时，请检查校园网连接及学校认证状态。") from None
+        except Error:
+            if authenticated:
+                raise
+            raise LoginError("浏览器认证失败，请检查座位预约网站和校园网连接。") from None
+
 
 
 # ============================================================
 # API 调用
 # ============================================================
 
-_SESSION = "whut"  # 模块级，run() 里会更新
+class SeatRateLimitError(RuntimeError):
+    """The seat server requested that the client stop sending requests."""
 
 
-def set_session(name):
-    global _SESSION
-    _SESSION = name
+class RequestPacer:
+    """Space repeated endpoints while allowing unrelated requests immediately."""
+    def __init__(self, interval=3.5, *, clock=None, sleep=None):
+        self.interval = interval
+        self.clock = clock or time.monotonic
+        self.sleep = sleep or time.sleep
+        self.lock = Lock()
+        self.endpoints = {}
+
+    def wait(self, url):
+        endpoint = urlsplit(url).path
+        with self.lock:
+            if endpoint not in self.endpoints:
+                self.endpoints[endpoint] = (Lock(), None)
+            endpoint_lock, _ = self.endpoints[endpoint]
+        with endpoint_lock:
+            with self.lock:
+                _, previous = self.endpoints[endpoint]
+            if previous is not None:
+                delay = self.interval - (self.clock() - previous)
+                if delay > 0:
+                    self.sleep(delay)
+            with self.lock:
+                self.endpoints[endpoint] = (endpoint_lock, self.clock())
 
 
-def api_post(path, token, body=None, timeout=10, silent=False):
-    """调用座位系统 API。silent=True 时超时不打印警告。"""
-    import requests
-    url = f"{API_BASE}/{path}"
-    headers = {"Content-Type": "application/json", "token": token}
-    try:
-        r = requests.post(url, json=body or {}, headers=headers, timeout=timeout)
-        data = r.json()
-        if not data.get("status") and data.get("code") == 20003:
-            print(yellow("\n🔄 Token 过期，刷新页面..."))
-            new_token = refresh_token(_SESSION)
-            if new_token:
-                print(green("✅ Token 已刷新"))
-            return {"status": True, "code": -1, "message": "token-expired", "data": {}}
-        return data
-    except Exception as e:
-        if not silent:
-            print(yellow(f"\n⚠️  API 调用失败: {e}"))
-        return None
+def prepare_reservation_page(page):
+    """The CLI owns room queries; avoid the homepage's duplicate prefetch."""
+    page.route(f"{API_BASE}/frontApi/res/findRoomDuration/**", lambda route: route.abort())
 
 
-def refresh_token(session):
-    """Token 过期后刷新页面并重新获取 token。"""
-    eval_js(session, "window.location.reload()")
-    time.sleep(5)
-    new_token = get_token(session)
-    if new_token:
-        return new_token
-    return None
+class SeatAPI:
+    def __init__(self, login, token, *, captcha=None, pacer=None):
+        self.login = login
+        self.token = token
+        self.refresh_lock = Lock()
+        self.refresh_error = None
+        self.sessions = []
+        self.session_lock = Lock()
+        self.thread = local()
+        self.captcha = captcha
+        self.pacer = pacer if pacer is not None else RequestPacer()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        for session in self.sessions:
+            session.close()
+
+    def _session(self):
+        import requests
+
+        if not hasattr(self.thread, "session"):
+            self.thread.session = requests.Session()
+            with self.session_lock:
+                self.sessions.append(self.thread.session)
+        return self.thread.session
+
+    def _refresh_token(self, expired_token):
+        with self.refresh_lock:
+            if self.refresh_error is not None:
+                raise LoginError(self.refresh_error)
+            if self.token == expired_token:
+                print(yellow("\n🔄 Token 过期，正在重新登录..."))
+                try:
+                    self.token = self.login(expired_token)
+                except LoginError as exc:
+                    self.refresh_error = str(exc)
+                    raise
+
+    def post(self, path, body=None, timeout=10, silent=False):
+        """只在服务端明确拒绝过期 Token 时重新认证并重试一次。"""
+        import requests
+
+        url = f"{API_BASE}/{path}"
+        session = self._session()
+        for attempt in range(2):
+            if attempt and self.captcha is not None and path.startswith("frontApi/make/freeBook/"):
+                cap_token = self.captcha.token(self)
+                url = f"{API_BASE}/{path.split('?', 1)[0]}?capToken={quote(cap_token, safe='')}"
+            self.pacer.wait(url)
+            token = self.token
+            headers = {"Content-Type": "application/json", "token": token}
+            try:
+                response = session.post(url, json=body or {}, headers=headers, timeout=timeout)
+                if response.status_code == 429:
+                    endpoint = path.split('?', 1)[0]
+                    raise SeatRateLimitError(f"图书馆接口限流（HTTP 429，{endpoint}），请稍后再试。")
+                data = response.json()
+            except (requests.RequestException, ValueError) as exc:
+                if not silent:
+                    print(yellow(f"\n⚠️  API 调用失败: {exc}"))
+                return None
+            if not isinstance(data, dict):
+                return None
+            message = data.get("message")
+            if not data.get("status") and isinstance(message, str) and "过于频繁" in message:
+                endpoint = path.split('?', 1)[0]
+                raise SeatRateLimitError(f"图书馆接口限流（{endpoint}）：{message[:160]}")
+            if data.get("status") or data.get("code") != 20003:
+                return data
+            if attempt:
+                raise LoginError("重新登录后的 Token 仍被预约系统拒绝。")
+            self._refresh_token(token)
 
 
 # ============================================================
@@ -168,49 +380,14 @@ def to_str(minutes):
 # 核心流程
 # ============================================================
 
-def wait_for_login(session):
-    """确保有已登录的页面，返回 (token, user)。如果已有则直接复用。"""
-
-    # 先检查当前 session 是否已登录
-    token = get_token(session)
-    if token:
-        user = get_user_info(session)
-        name = user.get("fullName", "?") if user else "?"
-        print(f"\n{green('✅ 复用已有登录态')} — {bold(name)}")
-        return token, user
-
-    print(f"\n{cyan('🌐 打开座位预约系统...')}")
-    print(f"{yellow('📌 请在弹出的浏览器窗口完成统一身份认证登录！')}\n")
-
-    # 打开主页
-    opencli(session, ["open", APP_URL], timeout=20)
-
-    print(f"{bold('⏳ 等待登录...')}", end="", flush=True)
-    for i in range(1, 999):
-        time.sleep(2)
-        token = get_token(session)
-        if token:
-            user = get_user_info(session)
-            name = user.get("fullName", "?") if user else "?"
-            print(f"\n{green('✅ 登录成功！')} 欢迎 {bold(name)}")
-            return token, user
-        if i % 10 == 0:
-            print(f"\n{yellow('⏳ 仍在等待登录...')}")
-        print(".", end="", flush=True)
-
-    print(red("\n❌ 超时"))
-    sys.exit(1)
-
-
-def get_rooms(token, date_str, floor):
+def get_rooms(api, date_str, floor):
     """获取要抢的房间列表"""
-    resp = api_post(
+    resp = api.post(
         f"frontApi/res/findRoomDuration/{BUILDING_ID}/{date_str}",
-        token,
         body={"dateType": "0", "amPm": "0", "floorId": "0",
               "power": False, "window": False},
     )
-    if not resp or (not resp.get("status") and resp.get("code") != -1):
+    if not resp or not resp.get("status"):
         print(red("❌ 获取房间列表失败"))
         return []
 
@@ -237,7 +414,7 @@ def get_rooms(token, date_str, floor):
     return rooms
 
 
-def resolve_start_end(token, date_str, start_arg, duration_arg):
+def resolve_start_end(api, date_str, start_arg, duration_arg):
     """确定开始和结束分钟数。start_arg 是开始时间，duration_arg 是预约时长（分钟）。"""
     now = datetime.now()
     current_min = now.hour * 60 + now.minute
@@ -245,14 +422,15 @@ def resolve_start_end(token, date_str, start_arg, duration_arg):
     # 开始时间：支持用户指定；不指定则从现在开始，对齐到 30 分钟
     if start_arg:
         start = to_minutes(start_arg)
+    elif date_str > now.date().isoformat():
+        start = 450
     else:
         start = max(current_min + 5, 450)   # 450 = 07:30
         start = ((start + 29) // 30) * 30   # 对齐到 30 分钟
 
     # 结束时间 — 通过 API 获取可用选项；负数时长表示预约到当天最晚可用结束时间
-    resp = api_post(
+    resp = api.post(
         f"frontApi/res/getEndTimes2/{BUILDING_ID}/{start}",
-        token,
     )
 
     if resp and resp.get("status") and resp.get("data"):
@@ -278,19 +456,15 @@ def resolve_start_end(token, date_str, start_arg, duration_arg):
 
     return start, end
 
-def get_seat_timeline(token, seat_id, date_str):
+def get_seat_timeline(api, seat_id, date_str):
     """获取某个座位在指定日期的实际空闲时间段，失败返回 None"""
-    try:
-        resp = api_post(
-            f"frontApi/res/getTimeLine/{seat_id}/{date_str}",
-            token,
-            timeout=5,
-            silent=True,
-        )
-        if resp and resp.get("status") and resp["data"]:
-            return resp["data"]  # {markList, freeList}
-    except Exception:
-        pass
+    resp = api.post(
+        f"frontApi/res/getTimeLine/{seat_id}/{date_str}",
+        timeout=5,
+        silent=True,
+    )
+    if resp and resp.get("status") and resp.get("data"):
+        return resp["data"]  # {markList, freeList}
     return None
 
 
@@ -300,7 +474,7 @@ def parse_timeline_range(label):
     return to_minutes(start_str), to_minutes(end_str)
 
 
-def find_candidate(token, room, date_str, target_start, target_end, min_duration=0):
+def find_candidate(api, room, date_str, target_start, target_end, min_duration=0):
     """在指定房间找符合条件的空闲座位，但不提交预约。
 
     min_duration > 0 时，只返回时长 >= min_duration 分钟的座位；
@@ -312,9 +486,8 @@ def find_candidate(token, room, date_str, target_start, target_end, min_duration
     room_id = room["id"]
     room_name = room["name"]
 
-    seats = api_post(
+    seats = api.post(
         f"frontApi/res/freeSeatIdsSlice/{room_id}/{date_str}",
-        token,
         body={"beginMinute": target_start, "endMinute": target_end,
               "minMinute": 0, "amPm": 0},
     )
@@ -332,7 +505,7 @@ def find_candidate(token, room, date_str, target_start, target_end, min_duration
 
     best_seat, best_s, best_e, best_dur = None, 0, 0, 0
     for sid, info in free_candidates:
-        tl = get_seat_timeline(token, info["id"], date_str)
+        tl = get_seat_timeline(api, info["id"], date_str)
         if not tl:
             continue
         for slot in tl.get("freeList", []):
@@ -348,6 +521,8 @@ def find_candidate(token, room, date_str, target_start, target_end, min_duration
             else:
                 if sdur > best_dur:
                     best_seat, best_s, best_e, best_dur = info, a, b, sdur
+        if best_dur == target_end - target_start:
+            break
 
     if best_seat is None:
         if min_duration > 0:
@@ -364,11 +539,11 @@ def find_candidate(token, room, date_str, target_start, target_end, min_duration
     }
 
 
-def book_candidate(token, candidate, date_str):
+def book_candidate(api, candidate, date_str):
     """提交预约。"""
-    resp = api_post(
-        f"frontApi/make/freeBook/{candidate['seat_id']}/{date_str}/{candidate['start']}/{candidate['end']}?capToken=",
-        token,
+    cap_token = api.captcha.token(api) if api.captcha is not None else "capToken"
+    resp = api.post(
+        f"frontApi/make/freeBook/{candidate['seat_id']}/{date_str}/{candidate['start']}/{candidate['end']}?capToken={quote(cap_token, safe='')}",
     )
     if resp and resp.get("status"):
         data = resp.get("data", {})
@@ -383,17 +558,27 @@ def book_candidate(token, candidate, date_str):
 # 抢座主循环
 # ============================================================
 
-def run(session, args):
-    set_session(session)
-    token, user = wait_for_login(session)
+def run(session, args, *, confirm=None):
+    login = SeatLogin(session)
+    with login.browser_page(on_page=prepare_reservation_page) as (page, token):
+        captcha = ReservationCaptcha(page, API_BASE)
 
+        def refresh(expired_token):
+            captcha.page, token = login.renew_page(captcha.page, expired_token, on_page=prepare_reservation_page)
+            return token
+
+        with SeatAPI(refresh, token, captcha=captcha) as api:
+            return run_reservation(api, args, confirm)
+
+
+def run_reservation(api, args, confirm):
     date_str = args.date or date.today().isoformat()
 
-    rooms = get_rooms(token, date_str, args.floor)
+    rooms = get_rooms(api, date_str, args.floor)
     if not rooms:
         return
 
-    start, end = resolve_start_end(token, date_str, args.start, args.duration)
+    start, end = resolve_start_end(api, date_str, args.start, args.duration)
     if start is None:
         return
 
@@ -418,25 +603,34 @@ def run(session, args):
     i = 0
     while args.max_attempts == 0 or i < args.max_attempts:
         i += 1
+        round_started = time.monotonic()
+        verification_retry_after = None
         room = random.choice(rooms)  # 多房间时随机选
-        success, result = find_candidate(token, room, date_str, start, end, min_duration=required_duration)
+        success, result = find_candidate(api, room, date_str, start, end, min_duration=required_duration)
 
         if success:
             candidate = result
             if not args.auto_confirm:
-                print(f"\n{green('✅ 找到符合条件的座位')}")
-                print(f"   📅 日期: {date_str}")
-                print(f"   ⏰ 时间: {to_str(candidate['start'])} ~ {to_str(candidate['end'])}  ({candidate['end'] - candidate['start']}分钟)")
-                print(f"   🪑  座位: {bold(candidate['seat_label'])}  ({candidate['seat_name']})")
-                print(f"   📍 位置: {candidate['room_name']}")
-                ans = input("确认预约这个座位？(y/N) ").strip().lower()
-                if ans != "y":
+                if confirm is None:
+                    print(f"\n{green('✅ 找到符合条件的座位')}")
+                    print(f"   📅 日期: {date_str}")
+                    print(f"   ⏰ 时间: {to_str(candidate['start'])} ~ {to_str(candidate['end'])}  ({candidate['end'] - candidate['start']}分钟)")
+                    print(f"   🪑  座位: {bold(candidate['seat_label'])}  ({candidate['seat_name']})")
+                    print(f"   📍 位置: {candidate['room_name']}")
+                    accepted = input("确认预约这个座位？(y/N) ").strip().lower() == "y"
+                else:
+                    accepted = confirm(candidate, date_str)
+                if not accepted:
                     delay = args.interval + random.uniform(-1, 1)
                     print(yellow(f"已跳过，继续刷新 | 等 {delay:.1f}s"))
                     time.sleep(max(0.5, delay))
                     continue
 
-            success, result = book_candidate(token, candidate, date_str)
+            try:
+                success, result = book_candidate(api, candidate, date_str)
+            except CaptchaAttemptError as exc:
+                success, result = False, str(exc)
+                verification_retry_after = exc.retry_after
 
         if success:
             print(f"\n{green('=' * 50)}")
@@ -449,7 +643,7 @@ def run(session, args):
             if result["message"]:
                 print(f"   💬 {result['message']}")
             print(f"{'=' * 50}\n")
-            return
+            return True
 
         if result is None:
             # 无空闲
@@ -462,10 +656,15 @@ def run(session, args):
             msg = result
             print(f"[{i}] {red('✗')} {msg}")
             # 终端错误：已有预约 / 黑名单 → 停止
-            if any(kw in msg for kw in ["已有预约", "黑名单", "不能预约"]):
+            if any(kw in msg for kw in ["已有预约", "存在未结束的预约", "黑名单", "不能预约"]):
                 print(yellow(f"\n⚠️  {msg}，停止。"))
                 return
+            if verification_retry_after is not None and args.max_attempts and i >= args.max_attempts:
+                continue
             delay = args.interval + random.uniform(-1, 1)
+            if verification_retry_after is not None:
+                delay = max(0, delay - (time.monotonic() - round_started), verification_retry_after)
+                print(yellow(f"[{i}] 等待 {max(0.5, delay):.1f} 秒后继续查找并验证。"))
             time.sleep(max(0.5, delay))
 
     if args.max_attempts > 0:
@@ -598,7 +797,7 @@ def main():
 
     p = argparse.ArgumentParser(
         description="武汉理工大学图书馆 · 座位预约抢座脚本",
-        epilog="跨平台 Python 脚本。需要 opencli + requests。"
+        epilog="通过 Playwright 无头浏览器登录。"
     )
     p.add_argument("-f", "--floor", type=int, default=0,
                    help="楼层：6=六楼, 7=七楼, 其他=全部 (默认: 0)")
@@ -614,8 +813,13 @@ def main():
     p.add_argument("--no-auto-confirm", dest="auto_confirm", action="store_false",
                    help="找到符合条件的座位后不自动预约，改为手动确认")
     p.set_defaults(auto_confirm=True)
-    p.add_argument("--session", default="whut", help="opencli session 名")
+    p.add_argument("--session", default="whut", help="登录会话缓存名称 (默认: whut)")
+    p.add_argument("--login-only", action="store_true", help="只检查登录，登录成功后退出")
     args = p.parse_args()
+
+    if args.login_only:
+        SeatLogin(args.session).authenticate()
+        return
 
     if args.once:
         args.max_attempts = 1
@@ -642,4 +846,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (LoginError, SeatRateLimitError, CaptchaError) as exc:
+        print(red(f"❌ {exc}"), file=sys.stderr)
+        sys.exit(1)

@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>南湖馆 · 座位预约</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <aside class="rail">
+      <a class="brand" href="#reservation">
+        <svg viewBox="0 0 36 36" aria-hidden="true"><path d="m6 14 12-7 12 7M7 16h22M10 19v8m8-8v8m8-8v8M7 29h22"/></svg>
+        <span>武汉理工大学<span class="brand-location">南湖图书馆</span></span>
+      </a>
+      <nav aria-label="工作台导航">
+        <a href="#reservation">座位预约</a>
+        <a href="#availability">空闲时段</a>
+        <a href="#settings">配置管理</a>
+      </nav>
+    </aside>
+    <main>
+      <header class="banner">
+        <h1 id="page-title">座位预约</h1>
+        <svg class="floorplan" viewBox="0 0 234 126" aria-hidden="true">
+          <path d="M26 108V18h182v90h-66m-48 0H26M26 63h20m162 0h-20M117 18v20m0 50v20"/>
+          <path d="M58 35h43v19H58zm75 0h43v19h-43zM58 72h43v19H58zm75 0h43v19h-43z"/>
+          <path d="M65 31v-6h9v6m11 0v-6h9v6m46 0v-6h9v6m11 0v-6h9v6M65 95v6h9v-6m11 0v6h9v-6m46 0v6h9v-6m11 0v6h9v-6"/>
+          <circle cx="117" cy="63" r="4"/>
+        </svg>
+      </header>
+
+      <p class="error" id="error" role="alert" hidden></p>
+      <div class="workspace" data-page="reservation">
+        <section class="panel" aria-labelledby="reservation-heading">
+          <div class="panel-head"><h2 id="reservation-heading">预约条件</h2></div>
+          <form id="reservation-form">
+            <div data-options></div>
+            <div class="actions">
+              <button type="submit" id="start-reservation" class="primary" disabled>开始预约</button>
+              <button type="button" id="login" disabled>验证登录</button>
+            </div>
+          </form>
+        </section>
+        <section class="panel" aria-labelledby="activity-heading">
+          <div class="panel-head activity-head">
+            <h2 id="activity-heading">运行记录</h2>
+            <span class="status" id="status" role="status">正在连接</span>
+          </div>
+          <div class="activity-body">
+            <div class="pending" id="pending" hidden>
+              <h3>找到符合条件的座位</h3>
+              <p id="seat-details"></p>
+              <div class="actions">
+                <button type="button" id="accept" class="primary">确认预约</button>
+                <button type="button" id="skip">跳过</button>
+              </div>
+            </div>
+            <p id="task-note" hidden></p>
+            <pre id="logs" aria-label="任务输出" tabindex="0" hidden></pre>
+            <button type="button" id="stop" class="stop" hidden>停止任务</button>
+          </div>
+        </section>
+      </div>
+
+      <section class="panel availability" data-page="availability" hidden aria-labelledby="availability-heading">
+        <div class="panel-head activity-head">
+          <h2 id="availability-heading">座位时间表</h2>
+          <span class="status" id="availability-status" role="status">尚未查询</span>
+        </div>
+        <form class="availability-form" id="availability-form">
+          <fieldset class="date-picker">
+            <legend>查询日期</legend>
+            <div data-date-options></div>
+          </fieldset>
+          <label>楼层<select name="floor"><option value="0">全部楼层</option><option value="6">六楼</option><option value="7">七楼</option></select></label>
+          <label>查询方式<select name="time_step">
+            <option value="30">快速查询</option>
+            <option value="0">精确查询</option>
+          </select></label>
+          <div class="actions">
+            <button type="submit" id="query" class="primary" disabled>查询空闲时段</button>
+            <button type="button" id="resume-query" disabled>继续查询</button>
+            <button type="button" id="stop-query" class="stop" hidden>停止查询</button>
+          </div>
+          <label class="check"><input id="auto-refresh" type="checkbox">自动刷新</label>
+        </form>
+        <div class="availability-output" id="availability-output" hidden>
+          <div class="availability-summary"><strong id="query-date"></strong><span id="query-count"></span></div>
+          <p class="error" id="availability-error" hidden></p>
+          <div class="availability-filters" id="availability-filters">
+            <label>阅览室<select id="room-filter"><option value="">全部阅览室</option></select></label>
+            <label>座位号<input id="seat-filter" type="search"></label>
+            <label class="check"><input id="free-only" type="checkbox">只看可预约</label>
+          </div>
+          <div id="seat-list"></div>
+          <div class="paging" id="paging" hidden>
+            <button type="button" id="previous">上一页</button>
+            <span id="page-count"></span>
+            <button type="button" id="next">下一页</button>
+          </div>
+        </div>
+      </section>
+
+      <section data-page="settings" hidden>
+        <form id="settings-form" class="settings-layout">
+          <section class="panel" aria-labelledby="account-heading">
+            <div class="panel-head"><h2 id="account-heading">学校账号</h2></div>
+            <div class="config-body">
+              <label>学工号<input name="username" autocomplete="username"></label>
+              <label>统一认证密码<input name="password" type="password" autocomplete="new-password"></label>
+              <label class="check" id="clear-password" hidden><input name="clear_password" type="checkbox">清除已保存密码</label>
+            </div>
+          </section>
+          <section class="panel" aria-labelledby="defaults-heading">
+            <div class="panel-head"><h2 id="defaults-heading">预约默认值</h2></div>
+            <div class="config-body">
+              <div data-options></div>
+              <div class="actions">
+                <button type="submit" id="save-settings" class="primary" disabled>保存配置</button>
+                <span id="save-status" role="status"></span>
+              </div>
+            </div>
+          </section>
+        </form>
+      </section>
+    </main>
+  </div>
+
+  <template id="reservation-options">
+    <fieldset>
+      <legend>楼层</legend>
+      <div class="floor-picker">
+        <label><input type="radio" name="floor" value="0" checked><span>全部楼层</span></label>
+        <label><input type="radio" name="floor" value="6"><span>六楼</span></label>
+        <label><input type="radio" name="floor" value="7"><span>七楼</span></label>
+      </div>
+    </fieldset>
+    <fieldset class="date-picker">
+      <legend>预约日期</legend>
+      <div data-date-options></div>
+    </fieldset>
+    <div class="fields">
+      <label>开始时间<select name="start" data-time-options></select></label>
+      <label data-custom-start hidden>自定义时间<input name="custom_start" type="text" maxlength="5" pattern="(?:[01][0-9]|2[0-3]):[0-5][0-9]" placeholder="09:15" disabled></label>
+      <label>预约时长<select name="duration_mode">
+        <option value="0">最长可用</option>
+        <option value="-1">直到闭馆</option>
+        <option value="custom">自定义时长</option>
+      </select></label>
+      <label data-duration-field hidden>分钟数<input type="number" name="duration" min="1" value="120" disabled></label>
+    </div>
+    <details>
+      <summary>查找设置</summary>
+      <div class="fields">
+        <label>刷新间隔（秒）<input name="interval" type="number" step="any" value="3" required></label>
+        <label>最多尝试次数（0 为不限）<input name="max_attempts" type="number" min="0" value="0" required></label>
+        <label>会话名称<input name="session" type="text" value="whut" placeholder="whut"></label>
+      </div>
+      <label class="check"><input type="checkbox" name="once">只尝试一次</label>
+    </details>
+    <label class="check"><input type="checkbox" name="manual_confirm">预约前手动确认</label>
+  </template>
+  <template id="date-options">
+    <div class="floor-picker">
+      <label><input type="radio" name="date" value="today" checked><span>今天</span></label>
+      <label><input type="radio" name="date" value="tomorrow"><span>明天</span></label>
+    </div>
+  </template>
+</body>
+</html>
